@@ -85,6 +85,74 @@ The encoders always address the **selected** track. Everything they reach, plus
 clock division and sample mode, is also in PARAMS under `track 1`–`track 8`, so
 it is all MIDI-mappable and saved with a PSET.
 
+## Grid
+
+A 16x8 varibright grid is optional; plug one in and it is picked up. The
+encoders and keys work exactly as before.
+
+Each **row is a track**, 1–8 from the top, the same order as the overview.
+
+```
+col   1      2      3 ............. 15     16
+      play   lock   13-key value strip     page
+```
+
+| | |
+|---|---|
+| **col 1** | start/stop that track — dim stopped, lit playing, flashes on every gate |
+| **col 2** | lock that voice to the sample it just played, again to unlock (K1 + K3) — bright while locked |
+| **col 3–15** | the current page's value for that track |
+| **col 16** | page select, latching — the row picks the page |
+
+Touching a row also **selects that track** on the norns, so the encoders are
+already on it: press a key for a coarse value, turn for the fine one. A value
+set from an encoder lights the nearest key.
+
+| page (col 16 row) | strip |
+|---|---|
+| 1 turing | 0 → 1, centre key = 0.5 |
+| 2 speed | `-4 -2 -1.5 -1 -0.5 -0.25 stop 0.25 0.5 1 1.5 2 4` |
+| 3 density | 0 → 1 |
+| 4 division | nine keys, `1/1` → `1/32` |
+| 5 steps | see below |
+| 6 level | 0 → 1 |
+| 7 pan | L → R, centre key = C |
+| 8 global | see below |
+
+The strip is 13 keys wide because an odd strip has a middle: stopped, centre
+pan and fully random all live on column 9. Turing, speed and pan fill outwards
+from it; density and level fill from the left.
+
+The speed keys are octaves and fifths rather than an even sweep, which would
+never land on 1.0x. The speed param steps in 0.05 so that 0.25x is a value it
+can hold.
+
+### Steps page
+
+The whole row becomes that track's register, the same picture as the screen:
+steps that fire are bright, the playhead brightest, and the row ends where the
+loop does. **Any key sets the length**, 1–16 — columns 1, 2 and 16 included, so
+there is no start/stop, lock or page column here.
+
+That leaves no key to leave with, so the page **goes back by itself** two
+seconds after your last touch, to wherever you came from.
+
+### Global page
+
+Columns 1, 2 and 16 behave as usual. In the strip:
+
+| | |
+|---|---|
+| **row 1** | master level |
+| **row 2** | fade time — `0.5 1 1.5 2 3 4 5 6 8 10 12 15 20` s |
+| **row 7** | reroll, one key per track on columns 3–10; bright while the new hand loads |
+| **row 8, col 3** | start all — tap |
+| **row 8, col 9** | stop all — **hold 0.5 s** |
+| **row 8, col 15** | fade all — **hold 0.5 s** |
+
+The two hold keys fill up while held and fire when full; letting go early, or
+changing page, disarms them.
+
 ### A note on E2
 
 Twelve o'clock is silence, as specified — the track keeps stepping, it just

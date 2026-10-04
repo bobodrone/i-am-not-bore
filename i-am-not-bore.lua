@@ -41,6 +41,22 @@
 -- keys: whichever you hold first is
 -- the modifier.
 --
+-- grid (16x8, optional): one row
+-- per track, top to bottom.
+--   col 1    : start/stop
+--   col 2    : lock/unlock sample
+--   col 3-15 : value of the page
+--   col 16   : page, top to bottom
+--     turing / speed / density /
+--     division / steps / level /
+--     pan / global
+-- steps page: the whole row is the
+-- register, key = length 1-16.
+-- returns by itself after 2 s.
+-- global page: master, fade time,
+-- reroll per track, start all,
+-- stop all + fade (hold to fire).
+--
 -- each track loads 15 samples from
 -- its folder at start and draws a
 -- new one on every gate, until you
@@ -127,6 +143,13 @@ local redraw_clock = nil
 local fade_clock = nil
 local fading = false
 
+-- the grid is optional: with none plugged in, every call on `g` is a no-op.
+local g = grid.connect()
+local grid_page = 1        -- index into GRID_PAGES, see the grid section
+local grid_prev_page = 1   -- where the steps page returns to
+local grid_steps_at = 0    -- last touch on the steps page, for its timeout
+local grid_hold = nil      -- the hold-to-fire key currently down, if any
+
 local sample_root = nil -- resolved at init from the path param
 local scan_error = nil  -- human-readable reason there is nothing to play
 
@@ -143,6 +166,7 @@ local function make_track(n)
     pool = {},             -- pool[slot] = filename currently loaded there
     pending = 0,           -- reads queued but not yet sent, for the screen
     last_file = nil,       -- what the most recent trigger played, for the screen
+    gate_at = 0,           -- when it last fired, for the grid's gate flash
     playing = false,
     pos = 0,               -- step index most recently played, 1..length
     reg = {},              -- the shift register: MAX_STEPS floats in [0,1)
@@ -416,6 +440,7 @@ local function step(n)
     -- locked: always slot 1. random: a fresh draw from the pool every gate.
     local slot = is_locked(n) and 1 or math.random(2, POOL_SIZE)
     t.last_file = t.pool[slot]
+    t.gate_at = util.time()
     -- wire protocol is 0-based on both track and slot
     engine.trig(n - 1, slot - 1, speed)
   end
@@ -588,7 +613,7 @@ local function add_params()
       controlspec.new(0, 1, "lin", 0.02, 0.5, ""))
 
     params:add_control(pid(n, "speed"), "speed",
-      controlspec.new(-4, 4, "lin", 0.1, 1.0, "x"))
+      controlspec.new(-4, 4, "lin", 0.05, 1.0, "x"))
 
     params:add_control(pid(n, "level"), "level",
       controlspec.new(0, 1, "lin", 0.01, 0.7, ""))
@@ -659,6 +684,8 @@ function cleanup()
   if loader_clock then clock.cancel(loader_clock) end
   if redraw_clock then clock.cancel(redraw_clock) end
   if fade_clock then clock.cancel(fade_clock) end
+  g:all(0)
+  g:refresh()
   engine.panic(0)
 end
 
@@ -791,9 +818,15 @@ end
 -- screen
 -- ----------------------------------------------------------------------
 
+-- two decimals so the grid's 0.25x reads as itself, minus a trailing zero
+-- so everything else still reads "1.0", "1.5".
+local function speed_number(s)
+  return (string.format("%.2f", math.abs(s)):gsub("0$", ""))
+end
+
 local function speed_text(s)
   if math.abs(s) <= SPEED_DEADZONE then return "stop" end
-  return string.format("%.1fx %s", math.abs(s), s < 0 and "rev" or "fwd")
+  return string.format("%sx %s", speed_number(s), s < 0 and "rev" or "fwd")
 end
 
 local function pan_text(p)
@@ -986,8 +1019,246 @@ local function draw_overview()
     screen.move(128, y)
     local s = params:get(pid(n, "speed"))
     screen.text_right(math.abs(s) <= SPEED_DEADZONE and "--"
-      or string.format("%s%.1f", s < 0 and "-" or "", math.abs(s)))
+      or ((s < 0 and "-" or "") .. speed_number(s)))
   end
+end
+
+-- ----------------------------------------------------------------------
+-- grid
+-- ----------------------------------------------------------------------
+
+-- one row per track, in the same order as the overview. the grid is an
+-- eight-channel mixer whose faders change meaning with the page:
+--
+--   col 1      start/stop          col 3-15   the page's value, 13 keys
+--   col 2      lock/unlock         col 16     page select, one per row
+--
+-- 13 keys rather than 14 because an odd strip has a middle: speed gets a
+-- physical "stopped", pan a centre and turing its fully random point, all on
+-- the same key. the price is resolution, so the grid sets coarse values and
+-- the encoders stay the fine control -- touching a row selects that track, so
+-- the encoders are already on it.
+local STRIP_X, STRIP_KEYS, STRIP_MID = 3, 13, 7
+local PAGE_X = 16
+
+-- every key is a pitch related to the next by an octave or a fifth. a linear
+-- sweep of the param's range would never land on 1.0x.
+local SPEED_KEYS = { -4, -2, -1.5, -1, -0.5, -0.25, 0, 0.25, 0.5, 1, 1.5, 2, 4 }
+local FADE_KEYS  = { 0.5, 1, 1.5, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20 }
+
+-- kind: "bar" fills from the left, "centre" fills out from the middle key,
+-- "dot" lights one key of `keys`. bar and centre spread lo..hi evenly across
+-- the strip unless `values` names each key's value.
+local GRID_PAGES = {
+  { key = "turing",  kind = "centre", lo = 0,  hi = 1 },
+  { key = "speed",   kind = "centre", values = SPEED_KEYS },
+  { key = "density", kind = "bar",    lo = 0,  hi = 1 },
+  { key = "div",     kind = "dot",    keys = #DIVISIONS },
+  { key = "length",  kind = "steps" },
+  { key = "level",   kind = "bar",    lo = 0,  hi = 1 },
+  { key = "pan",     kind = "centre", lo = -1, hi = 1 },
+  { kind = "global" },
+}
+local PAGE_STEPS, PAGE_GLOBAL = 5, 8
+
+-- the two strips on the global page, which are not per-track
+local MASTER_STRIP = { kind = "bar", lo = 0, hi = 1 }
+local FADE_STRIP   = { kind = "bar", values = FADE_KEYS }
+
+-- the steps page takes all 16 columns, page column included, so it cannot be
+-- left by pressing a page key. it goes back by itself instead.
+local STEPS_TIMEOUT = 2.0
+
+-- stop all and fade all only fire once held this long: they sit a finger's
+-- width from keys you press all the time.
+local GRID_HOLD = 0.5
+local GATE_FLASH = 0.1
+
+-- global page, strip area. rows 3-6 are unused.
+local GLOBAL_MASTER_Y, GLOBAL_FADE_Y, GLOBAL_REROLL_Y, GLOBAL_ACTION_Y = 1, 2, 7, 8
+local START_ALL_X, STOP_ALL_X, FADE_ALL_X = 3, 9, 15
+
+local function nearest(values, v)
+  local best, dist = 1, math.huge
+  for i, x in ipairs(values) do
+    local d = math.abs(x - v)
+    if d < dist then best, dist = i, d end
+  end
+  return best
+end
+
+-- strip key 1..STRIP_KEYS <-> param value. values set from the encoders fall
+-- between keys, so reading back picks the nearest one.
+local function strip_value(spec, i)
+  if spec.values then return spec.values[i] end
+  if spec.kind == "dot" then return i end
+  return spec.lo + (i - 1) / (STRIP_KEYS - 1) * (spec.hi - spec.lo)
+end
+
+local function strip_key(spec, v)
+  if spec.values then return nearest(spec.values, v) end
+  if spec.kind == "dot" then return v end
+  return util.round((v - spec.lo) / (spec.hi - spec.lo) * (STRIP_KEYS - 1)) + 1
+end
+
+local function draw_strip(y, spec, v)
+  local at = strip_key(spec, v)
+  for i = 1, (spec.keys or STRIP_KEYS) do
+    local level
+    if spec.kind == "dot" then
+      level = 2
+    elseif spec.kind == "centre" then
+      local lit = (i >= STRIP_MID and i <= at) or (i <= STRIP_MID and i >= at)
+      level = lit and 5 or 0
+      if i == STRIP_MID then level = 3 end
+    else
+      level = i <= at and 5 or 0
+    end
+    if i == at then level = 12 end
+    g:led(STRIP_X + i - 1, y, level)
+  end
+end
+
+-- the register itself, as on the screen: steps that fire are bright, the
+-- playhead brightest, and the row ends where the loop does.
+local function draw_steps_row(t)
+  local length = params:get(pid(t.index, "length"))
+  for i = 1, length do
+    local here = t.playing and t.pos == i
+    if gate(t, i) then
+      g:led(i, t.index, here and 15 or 6)
+    else
+      g:led(i, t.index, here and 10 or 2)
+    end
+  end
+end
+
+local function draw_global()
+  draw_strip(GLOBAL_MASTER_Y, MASTER_STRIP, params:get("master"))
+  draw_strip(GLOBAL_FADE_Y, FADE_STRIP, params:get("fade_time"))
+
+  -- reroll: lit while that track's new hand is still loading
+  for n = 1, NUM_TRACKS do
+    g:led(STRIP_X + n - 1, GLOBAL_REROLL_Y, tracks[n].pending > 0 and 15 or 4)
+  end
+
+  -- the hold-to-fire keys fill up while held, so you can see one arming
+  local function hold_level(x)
+    local h = grid_hold
+    if not (h and h.x == x) then return 4 end
+    if h.fired then return 15 end
+    return 4 + math.floor(math.min(1, (util.time() - h.at) / GRID_HOLD) * 11)
+  end
+  g:led(START_ALL_X, GLOBAL_ACTION_Y, 4)
+  g:led(STOP_ALL_X, GLOBAL_ACTION_Y, hold_level(STOP_ALL_X))
+  g:led(FADE_ALL_X, GLOBAL_ACTION_Y, fading and 15 or hold_level(FADE_ALL_X))
+end
+
+local function grid_redraw()
+  local now = util.time()
+
+  if grid_page == PAGE_STEPS and (now - grid_steps_at) > STEPS_TIMEOUT then
+    grid_page = grid_prev_page
+  end
+
+  -- fires from here rather than from the release, so it goes off while the
+  -- key is still down and the LED reaching full is the moment it happens.
+  if grid_hold and not grid_hold.fired and (now - grid_hold.at) >= GRID_HOLD then
+    grid_hold.fired = true
+    grid_hold.action()
+  end
+
+  g:all(0)
+
+  if grid_page == PAGE_STEPS then
+    for n = 1, NUM_TRACKS do draw_steps_row(tracks[n]) end
+    g:refresh()
+    return
+  end
+
+  local spec = GRID_PAGES[grid_page]
+  for n = 1, NUM_TRACKS do
+    local t = tracks[n]
+    local level = t.playing and 8 or 2
+    if t.playing and (now - t.gate_at) < GATE_FLASH then level = 15 end
+    g:led(1, n, level)
+    g:led(2, n, is_locked(n) and 15 or 2)
+    g:led(PAGE_X, n, n == grid_page and 15 or 3)
+    if spec.kind ~= "global" then
+      draw_strip(n, spec, params:get(pid(n, spec.key)))
+    end
+  end
+  if spec.kind == "global" then draw_global() end
+
+  g:refresh()
+end
+
+local function grid_global_key(x, y)
+  local i = x - STRIP_X + 1
+
+  if y == GLOBAL_MASTER_Y then
+    params:set("master", strip_value(MASTER_STRIP, i))
+  elseif y == GLOBAL_FADE_Y then
+    params:set("fade_time", strip_value(FADE_STRIP, i))
+  elseif y == GLOBAL_REROLL_Y and i <= NUM_TRACKS then
+    selected = i
+    reroll(i)
+  elseif y == GLOBAL_ACTION_Y then
+    if x == START_ALL_X then
+      start_all()
+    elseif x == STOP_ALL_X then
+      grid_hold = { x = x, y = y, at = util.time(), action = stop_all }
+    elseif x == FADE_ALL_X then
+      grid_hold = { x = x, y = y, at = util.time(), action = fade_all }
+    end
+  end
+end
+
+g.key = function(x, y, z)
+  if grid_page == PAGE_STEPS then
+    -- releases count as touches too, so holding a key keeps the page up
+    grid_steps_at = util.time()
+    if z == 1 then
+      selected = y
+      params:set(pid(y, "length"), x)
+    end
+    redraw()
+    return
+  end
+
+  if z == 0 then
+    -- letting go early disarms; the fire itself happens in grid_redraw()
+    if grid_hold and grid_hold.x == x and grid_hold.y == y then grid_hold = nil end
+    redraw()
+    return
+  end
+
+  if x == PAGE_X then
+    -- a key armed on the page being left must not go off on the next one
+    grid_hold = nil
+    if y == PAGE_STEPS then
+      grid_prev_page = grid_page
+      grid_steps_at = util.time()
+    end
+    grid_page = y
+  elseif x == 1 then
+    selected = y
+    toggle_track(y)
+  elseif x == 2 then
+    selected = y
+    toggle_lock(y)
+  elseif grid_page == PAGE_GLOBAL then
+    grid_global_key(x, y)
+  else
+    local spec = GRID_PAGES[grid_page]
+    local i = x - STRIP_X + 1
+    selected = y
+    if i <= (spec.keys or STRIP_KEYS) then
+      params:set(pid(y, spec.key), strip_value(spec, i))
+    end
+  end
+
+  redraw()
 end
 
 function redraw()
@@ -1002,4 +1273,8 @@ function redraw()
   screen.clear()
   if k1_held then draw_overview() else draw_detail() end
   screen.update()
+
+  -- the grid rides the same timer as the screen, and every handler that
+  -- changes state already ends in a redraw.
+  grid_redraw()
 end

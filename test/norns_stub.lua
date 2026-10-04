@@ -148,6 +148,11 @@ function P:set(id, v, silent)
     return
   end
   if p.min then v = math.max(p.min, math.min(p.max, v)) end
+  -- controls snap to their spec's step, as on the norns: a value the spec
+  -- cannot hold must not look settable here.
+  if p.t == "control" and p.step and p.step > 0 then
+    v = math.floor(v / p.step + 0.5) * p.step
+  end
   p.value = v
   if p.action and not silent then p.action(v) end
 end
@@ -184,6 +189,36 @@ function S.screen_says(sub)
 end
 S.screen = screen
 
+-- ---------------- grid ----------------
+-- one 16x8 varibright device. leds[y][x] is what the last refresh() showed,
+-- so tests assert on what is actually lit rather than on what was drawn.
+local dev = { key = nil, buf = {}, leds = {} }
+local function blank()
+  local b = {}
+  for y = 1, 8 do b[y] = {}; for x = 1, 16 do b[y][x] = 0 end end
+  return b
+end
+dev.buf, dev.leds = blank(), blank()
+function dev:led(x, y, l)
+  if x < 1 or x > 16 or y < 1 or y > 8 then
+    error(string.format("grid led out of range: %s,%s", tostring(x), tostring(y)))
+  end
+  if l < 0 or l > 15 or l ~= math.floor(l) then
+    error("grid led level not an integer 0..15: " .. tostring(l))
+  end
+  self.buf[y][x] = l
+end
+function dev:all(l)
+  for y = 1, 8 do for x = 1, 16 do self.buf[y][x] = l end end
+end
+function dev:refresh()
+  for y = 1, 8 do for x = 1, 16 do self.leds[y][x] = self.buf[y][x] end end
+end
+S.grid_dev = dev
+S.grid = { connect = function() return dev end }
+function S.grid_key(x, y, z) dev.key(x, y, z) end
+function S.led(x, y) return dev.leds[y][x] end
+
 S._path = { audio = "/audio/", dust = "/dust/", data = "/data/" }
 
 -- install globals
@@ -192,6 +227,7 @@ function S.install()
   _G.params = S.params
   _G.clock = S.clock
   _G.screen = S.screen
+  _G.grid = S.grid
   _G._path = S._path
   _G.norns = { state = {} }
   package.loaded["util"] = S.util

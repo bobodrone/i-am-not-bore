@@ -364,6 +364,200 @@ local both2 = S.screen_says("K2+K3 reroll")
 key(3, 0); key(2, 0); gap()
 check("K2 first, then K3: hint stays on K2's combo", both2)
 
+-- ---- grid helpers ---------------------------------------------------------
+local function gpress(x, y) S.grid_key(x, y, 1); S.grid_key(x, y, 0); gap(0.1) end
+local function near(a, b) return math.abs(a - b) < 1e-6 end
+local function row(y, x1, x2)
+  local out = {}
+  for x = x1, x2 do out[#out + 1] = string.format("%x", S.led(x, y)) end
+  return table.concat(out)
+end
+
+print("\n=== grid: transport, lock, selection ===")
+params:set("stop_all")
+assert(select_track(1))
+check("the grid is drawn from init, page column lit on turing",
+  S.led(16, 1) == 15 and S.led(16, 2) == 3, row(1, 16, 16) .. row(2, 16, 16))
+check("a stopped track's play key is dim", S.led(1, 3) == 2, tostring(S.led(1, 3)))
+
+gpress(1, 3)
+S.calls = {}; S.pump_all(40)
+check("col 1 starts that row's track", #trigs_for(2) > 0, #trigs_for(2) .. " triggers")
+check("and only that track", #trigs_for(0) == 0 and #trigs_for(3) == 0)
+check("touching a row selects it on the norns", selected_track() == 3,
+  "T" .. tostring(selected_track()))
+S.now = S.now + 1; redraw()
+check("a playing track's play key is lit", S.led(1, 3) == 8, tostring(S.led(1, 3)))
+S.pump_all(4); redraw()               -- density is 1.0, so it has just fired
+check("and flashes on a gate", S.led(1, 3) == 15, tostring(S.led(1, 3)))
+gpress(1, 3)
+S.calls = {}; S.pump_all(40)
+check("col 1 again stops it", #trigs_for(2) == 0 and S.led(1, 3) == 2)
+
+gpress(2, 5)
+check("col 2 locks that row's voice", params:string("t5_mode") == "locked")
+check("and lights while locked", S.led(2, 5) == 15 and S.led(2, 4) == 2)
+gpress(2, 5)
+check("col 2 again unlocks", params:string("t5_mode") == "random" and S.led(2, 5) == 2)
+
+print("\n=== grid: value pages ===")
+gpress(3, 2)
+check("turing: leftmost key is 0", near(params:get("t2_turing"), 0), tostring(params:get("t2_turing")))
+gpress(15, 2)
+check("turing: rightmost key is 1", near(params:get("t2_turing"), 1))
+gpress(9, 2)
+check("turing: centre key is 0.5", near(params:get("t2_turing"), 0.5))
+check("the centre key lights alone", row(2, 3, 15) == "000000c000000", row(2, 3, 15))
+gpress(12, 2)
+check("a centre strip fills out from the middle", row(2, 3, 15) == "000000355c000", row(2, 3, 15))
+check("other rows are untouched", near(params:get("t1_turing"), 0.5))
+
+gpress(16, 2)                          -- speed
+check("page key latches", S.led(16, 2) == 15 and S.led(16, 1) == 3)
+local want = { -4, -2, -1.5, -1, -0.5, -0.25, 0, 0.25, 0.5, 1, 1.5, 2, 4 }
+local got, okv = {}, true
+for i = 1, 13 do
+  gpress(2 + i, 6)
+  got[i] = params:get("t6_speed")
+  if not near(got[i], want[i]) then okv = false end
+end
+check("speed keys are octaves and fifths, centre = stop", okv, table.concat(got, " "))
+gpress(8, 6)
+S.texts = {}; redraw()
+check("0.25x survives the param and reads as itself on screen",
+  near(params:get("t6_speed"), -0.25) and S.screen_says("0.25x rev"))
+check("reverse fills leftwards from the centre", row(6, 3, 15) == "00000c3000000", row(6, 3, 15))
+params:set("t6_speed", 1.2)            -- as if set from E2, between two keys
+redraw()
+check("an encoder value lights the nearest key (1.0x)", S.led(12, 6) == 12, row(6, 3, 15))
+
+gpress(16, 3)                          -- density
+gpress(3, 4); local d0 = params:get("t4_density")
+gpress(15, 4)
+check("density runs 0..1 across the strip", near(d0, 0) and near(params:get("t4_density"), 1))
+check("a bar strip fills from the left", row(4, 3, 15) == "555555555555c", row(4, 3, 15))
+
+gpress(16, 4)                          -- division
+gpress(3, 7); local dv1 = params:string("t7_div")
+gpress(11, 7)
+check("division: 9 keys, 1/1 to 1/32", dv1 == "1/1" and params:string("t7_div") == "1/32",
+  dv1 .. " .. " .. params:string("t7_div"))
+gpress(13, 7)
+check("the dark keys past the 9th do nothing", params:string("t7_div") == "1/32")
+check("division lights one key", row(7, 3, 15) == "22222222c0000", row(7, 3, 15))
+
+gpress(16, 6)                          -- level
+S.calls = {}
+gpress(9, 1)
+local lv = S.calls_named("trackLevel")
+check("level reaches the engine", near(params:get("t1_level"), 0.5) and #lv == 1
+  and lv[1].args[1] == 0 and near(lv[1].args[2], 0.5))
+
+gpress(16, 7)                          -- pan
+gpress(3, 1); local pl = params:get("t1_pan")
+gpress(15, 1); local pr = params:get("t1_pan")
+gpress(9, 1)
+check("pan runs L..R with centre in the middle",
+  near(pl, -1) and near(pr, 1) and near(params:get("t1_pan"), 0), pl .. " " .. pr)
+
+print("\n=== grid: steps page ===")
+gpress(16, 7)                          -- come from pan
+params:set("t3_length", 8)
+gpress(16, 5)
+local lit = 0
+for x = 1, 16 do if S.led(x, 3) > 0 then lit = lit + 1 end end
+check("each row shows its register, as long as its loop", lit == 8, lit .. " lit")
+gpress(16, 3)
+check("all 16 columns are lengths, column 16 included",
+  params:get("t3_length") == 16, tostring(params:get("t3_length")))
+gpress(1, 3)
+check("column 1 is length 1, not start/stop", params:get("t3_length") == 1)
+S.calls = {}; S.pump_all(40)
+check("so nothing started", #trigs_for(2) == 0)
+gpress(5, 8)
+check("several tracks can be set in one visit", params:get("t8_length") == 5)
+S.now = S.now + 1.5; redraw()
+-- nothing is running, so no register key is at 15: only a page key can be
+check("the page holds while you are still within 2 s", S.led(16, 7) ~= 15,
+  "pan key " .. S.led(16, 7))
+gpress(6, 8)
+S.now = S.now + 1.5; redraw()
+check("a touch restarts the timeout", params:get("t8_length") == 6 and S.led(16, 7) ~= 15,
+  "pan key " .. S.led(16, 7))
+S.now = S.now + 1.0; redraw()
+check("it returns to the page it came from after 2 s idle", S.led(16, 7) == 15,
+  "pan key " .. S.led(16, 7))
+
+print("\n=== grid: global page ===")
+gpress(16, 8)
+gpress(9, 1)
+check("row 1 is master level", near(params:get("master"), 0.5))
+gpress(3, 2); local f0 = params:get("fade_time")
+gpress(15, 2)
+check("row 2 is fade time, 0.5 s to 20 s", near(f0, 0.5) and near(params:get("fade_time"), 20))
+check("master does not move a track param", near(params:get("t1_pan"), 0))
+
+S.pump_all(200); S.calls = {}
+gpress(6, 7)                           -- reroll track 4
+S.pump_all(60)
+local gr, only4 = S.calls_named("loadSlot"), true
+for _, c in ipairs(gr) do if c.args[1] ~= 3 or c.args[2] < 1 then only4 = false end end
+check("row 7 rerolls one track per key", #gr == 15 and only4, #gr .. " loads")
+
+gpress(3, 8)
+S.calls = {}; S.pump_all(40)
+live = 0
+for n = 0, 7 do if #trigs_for(n) > 0 then live = live + 1 end end
+check("start all fires on a tap", live == 8, live .. "/8 running")
+
+gpress(9, 8)
+S.calls = {}; S.pump_all(40)
+live = 0
+for n = 0, 7 do if #trigs_for(n) > 0 then live = live + 1 end end
+check("a tap on stop all does nothing", live == 8, live .. "/8 running")
+S.now = S.now + 1; redraw()
+S.calls = {}; S.pump_all(40)
+check("nor does it go off later, once released", #trigs_for(0) > 0)
+
+S.grid_key(9, 8, 1)
+S.now = S.now + 0.25; redraw()
+local arming = S.led(9, 8)
+S.now = S.now + 0.3; redraw()
+S.calls = {}; S.pump_all(40)
+any = 0
+for n = 0, 7 do any = any + #trigs_for(n) end
+check("stop all fires once held 0.5 s", any == 0, any .. " triggers")
+check("its key fills while arming", arming > 4 and arming < 15 and S.led(9, 8) == 15,
+  arming .. " -> " .. S.led(9, 8))
+S.grid_key(9, 8, 0); gap()
+
+gpress(3, 8)                           -- start all again
+S.calls = {}
+S.grid_key(15, 8, 1); S.now = S.now + 0.6; redraw()
+faded = false
+for _, c in ipairs(S.calls_named("setMaster")) do if c.args[1] == 0 then faded = true end end
+S.now = S.now + 5; redraw()
+local once = 0
+for _, c in ipairs(S.calls_named("setMaster")) do if c.args[1] == 0 then once = once + 1 end end
+S.grid_key(15, 8, 0); gap()
+check("fade all fires once held", faded)
+check("and only once, however long it is held", once == 1, once .. " fades")
+S.pump_all(2)                          -- let the fade finish and stop everything
+
+-- a key armed on one page must not go off after the page changes under it
+gpress(3, 8)
+S.grid_key(9, 8, 1)
+gpress(16, 5)                          -- to the steps page, stop all still down
+S.now = S.now + 1; redraw()
+S.grid_key(9, 8, 0)
+S.calls = {}; S.pump_all(40)
+check("changing page disarms a held key", #trigs_for(0) > 0)
+check("and its release is not read as a length", params:get("t8_length") == 6,
+  tostring(params:get("t8_length")))
+params:set("stop_all")
+S.now = S.now + 3; redraw()
+gpress(16, 1)
+
 print("\n=== redraw + cleanup ===")
 local o1 = pcall(redraw); tap(1)
 local o2 = pcall(redraw)
